@@ -23,6 +23,7 @@ from boltzgen.task.predict.writer import (
 )
 from boltzgen.task.task import Task
 from boltzgen.utils.pipeline_progress_bar import PipelineProgressBar
+from boltzgen.utils.hpu import HPUMixedPrecision, SingleHPUStrategy
 from boltzgen.utils.xpu import SingleXPUStrategy, XPUMixedPrecision
 
 
@@ -160,7 +161,7 @@ class Predict(Task):
                 )
             )
 
-        # Check if XPU accelerator is requested and use custom strategy
+        # Check if XPU or HPU accelerator is requested and use custom strategy
         if self.trainer.get("accelerator") == "xpu":
             # Handle precision for XPU - use custom XPU precision plugin
             precision = self.trainer.pop("precision", None)
@@ -168,6 +169,13 @@ class Predict(Task):
             if precision in ("16-mixed", "bf16-mixed"):
                 precision_plugin = XPUMixedPrecision(precision=precision)
             strategy = SingleXPUStrategy(precision_plugin=precision_plugin)
+        elif self.trainer.get("accelerator") == "hpu":
+            # Handle precision for HPU - bf16-mixed is preferred on Gaudi2
+            precision = self.trainer.pop("precision", "bf16-mixed")
+            precision_plugin = None
+            if precision in ("16-mixed", "bf16-mixed"):
+                precision_plugin = HPUMixedPrecision(precision=precision)
+            strategy = SingleHPUStrategy(precision_plugin=precision_plugin)
         else:
             # Set up trainer
             strategy = "auto"

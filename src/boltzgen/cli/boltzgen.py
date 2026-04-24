@@ -166,7 +166,7 @@ def add_configure_arguments(
     p.add_argument(
         "--accelerator",
         type=str,
-        choices=["auto", "gpu", "xpu", "cpu", "cuda"],
+        choices=["auto", "gpu", "xpu", "hpu", "cpu", "cuda"],
         default="auto",
         help="Accelerator to use. Default: %(default)s.",
     )
@@ -945,13 +945,15 @@ class BinderDesignPipeline:
             protocol_config, args.config, step_names
         )
 
-        # Detect available devices (CUDA or XPU)
+        # Detect available devices (CUDA, XPU, or HPU)
         if args.devices is not None:
             devices = args.devices
         elif torch.cuda.is_available():
             devices = torch.cuda.device_count()
         elif hasattr(torch, "xpu") and torch.xpu.is_available():
             devices = torch.xpu.device_count()
+        elif hasattr(torch, "hpu") and torch.hpu.is_available():
+            devices = torch.hpu.device_count()
         else:
             devices = 1  # CPU fallback
         print(f"Using {devices} devices")
@@ -962,6 +964,8 @@ class BinderDesignPipeline:
                 accelerator = "gpu"
             elif hasattr(torch, "xpu") and torch.xpu.is_available():
                 accelerator = "xpu"
+            elif hasattr(torch, "hpu") and torch.hpu.is_available():
+                accelerator = "hpu"
             else:
                 accelerator = "cpu"
         else:

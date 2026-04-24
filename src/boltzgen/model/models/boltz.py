@@ -1091,7 +1091,8 @@ class Boltz(LightningModule):
 
     def _get_device(self):
         """Get the appropriate device for tensor creation."""
-        # Prioritize XPU over CUDA when both are available
+        if hasattr(torch, "hpu") and torch.hpu.is_available():
+            return "hpu"
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             return "xpu"
         if torch.cuda.is_available():

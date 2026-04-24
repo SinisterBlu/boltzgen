@@ -238,7 +238,9 @@ def get_autocast_device_type() -> str:
     -------
         The device type for torch.autocast.
     """
-    if hasattr(torch, "xpu") and torch.xpu.is_available():
+    if hasattr(torch, "hpu") and torch.hpu.is_available():
+        device_type = "hpu"
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
         device_type = "xpu"
     elif torch.cuda.is_available() and torch.cuda.device_count() > 0:
         device_type = "cuda"
