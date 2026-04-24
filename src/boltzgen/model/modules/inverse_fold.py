@@ -48,7 +48,8 @@ class GaussianSmearing(torch.nn.Module):
         self.register_buffer("offset", offset)
 
     def forward(self, dist):
-        dist = (dist.unsqueeze(-1) - self.offset.view(1, 1, -1)).flatten(start_dim=1)
+        offset = self.offset.to(dist.device)
+        dist = (dist.unsqueeze(-1) - offset.view(1, 1, -1)).flatten(start_dim=1)
         return torch.exp(self.coeff * torch.pow(dist, 2))
 
 
@@ -457,11 +458,35 @@ class InverseFoldingEncoder(nn.Module):
         return node_attr, edge_attr
 
     def forward(self, feats):
-        edge_idx, valid_mask, bond = self.init_knn_graph(feats)
-        geo_feat = self.extract_geo_feat(feats, edge_idx, valid_mask)
-        node_attr, edge_attr = self.extract_attr_feat(feats, edge_idx, valid_mask)
-        if self.enable_input_embedder:
-            node_attr = _hpu_select(feats["s_inputs"], valid_mask)
+        # init_knn_graph, extract_geo_feat, extract_attr_feat all involve
+        # dynamic-shape ops (cdist, topk, boolean indexing) that the HPU graph
+        # compiler cannot handle.  Run them on CPU; move results to HPU for the
+        # actual transformer encoder layers.
+        device = next(self.parameters()).device
+        if device.type == "hpu":
+            feats_cpu = {
+                k: v.cpu() if isinstance(v, Tensor) else v for k, v in feats.items()
+            }
+            edge_idx_cpu, valid_mask_cpu, bond_cpu = self.init_knn_graph(feats_cpu)
+            geo_feat_cpu = self.extract_geo_feat(feats_cpu, edge_idx_cpu, valid_mask_cpu)
+            node_attr_cpu, edge_attr_cpu = self.extract_attr_feat(
+                feats_cpu, edge_idx_cpu, valid_mask_cpu
+            )
+            if self.enable_input_embedder:
+                node_attr_cpu = feats_cpu["s_inputs"][valid_mask_cpu]
+
+            valid_mask = valid_mask_cpu.to(device)
+            edge_idx = edge_idx_cpu.to(device)
+            bond = bond_cpu.to(device)
+            geo_feat = geo_feat_cpu.to(device)
+            node_attr = node_attr_cpu.to(device)
+            edge_attr = edge_attr_cpu.to(device)
+        else:
+            edge_idx, valid_mask, bond = self.init_knn_graph(feats)
+            geo_feat = self.extract_geo_feat(feats, edge_idx, valid_mask)
+            node_attr, edge_attr = self.extract_attr_feat(feats, edge_idx, valid_mask)
+            if self.enable_input_embedder:
+                node_attr = feats["s_inputs"][valid_mask]
 
         N = valid_mask.sum()
         s = self.linear_token_to_node(node_attr)
@@ -540,7 +565,7 @@ class InverseFoldingDecoder(nn.Module):
     def forward(self, s, z, edge_idx, valid_mask, feats):
         with torch.no_grad():
             src_idx, dst_idx = edge_idx[0], edge_idx[1]
-            rand = torch.rand(valid_mask.sum(), device=valid_mask.device)
+            rand = torch.rand(valid_mask.sum().item(), device=valid_mask.device)
             res_type_edge_visibility = rand[src_idx] < rand[dst_idx]
             res_type_clone = feats["res_type_clone"].bool()
             res_type_clone = _hpu_select(res_type_clone, valid_mask)[src_idx]
@@ -566,13 +591,41 @@ class InverseFoldingDecoder(nn.Module):
 
     @torch.no_grad()
     def sample(self, s, z, edge_idx, valid_mask, feats):
-        """Sample the output from the decoder."""
+        """Sample the output from the decoder.
+
+        The autoregressive loop uses per-token boolean indexing (dynamic shape)
+        throughout — incompatible with HPU graph compilation.  When called on
+        HPU, temporarily move the model and all tensors to CPU, run sampling
+        there, then move outputs back.
+        """
+        device = s.device
+        if device.type == "hpu":
+            feats_cpu = {
+                k: v.cpu() if isinstance(v, Tensor) else v for k, v in feats.items()
+            }
+            self.to("cpu")
+            try:
+                result = self._sample_impl(
+                    s.cpu(), z.cpu(), edge_idx.cpu(), valid_mask.cpu(), feats_cpu
+                )
+            finally:
+                self.to(device)
+            # Move outputs back to HPU (feats["res_type"] was set inside)
+            feats["res_type"] = feats_cpu["res_type"].to(device)
+            return {
+                k: v.to(device) if isinstance(v, Tensor) else v
+                for k, v in result.items()
+            }
+        return self._sample_impl(s, z, edge_idx, valid_mask, feats)
+
+    def _sample_impl(self, s, z, edge_idx, valid_mask, feats):
+        """Core autoregressive sampling logic (device-agnostic)."""
         num_nodes = s.shape[0]
 
         if "inverse_fold_design_mask" in feats:
-            design_mask = _hpu_select(feats["inverse_fold_design_mask"].bool(), valid_mask)
+            design_mask = feats["inverse_fold_design_mask"].bool()[valid_mask]
         else:
-            design_mask = _hpu_select(feats["design_mask"].bool(), valid_mask)
+            design_mask = feats["design_mask"].bool()[valid_mask]
         num_not_design = (~design_mask).sum().item()
         num_design = design_mask.sum().item()
         assert num_design == num_nodes - num_not_design, (
@@ -643,17 +696,17 @@ class InverseFoldingDecoder(nn.Module):
 
         n_tokens = valid_mask.shape[1]
         res_type = torch.zeros(1, n_tokens, self.num_res_type, device=s.device)
-        _hpu_assign(res_type, valid_mask, decoded_seq)
+        res_type[valid_mask] = decoded_seq
         unk_ids = torch.full(
             [(~valid_mask).sum().item()], const.tokens.index("UNK"), device=s.device
         )
         unk_value = F.one_hot(unk_ids, num_classes=const.num_tokens)
-        _hpu_assign(res_type, ~valid_mask, unk_value.float())
+        res_type[~valid_mask] = unk_value.float()
         feats["res_type"] = res_type.long()
 
         logist_dense = torch.zeros(1, n_tokens, self.num_res_type, device=logits.device)
-        _hpu_assign(logist_dense, valid_mask, logits)
-        _hpu_assign(logist_dense, ~valid_mask, _hpu_select(feats["res_type_clone"], ~valid_mask).float())
+        logist_dense[valid_mask] = logits
+        logist_dense[~valid_mask] = feats["res_type_clone"][~valid_mask].float()
 
         out_dict = {
             "logits": logist_dense,
