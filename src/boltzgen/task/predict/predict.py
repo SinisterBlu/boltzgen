@@ -95,6 +95,20 @@ class Predict(Task):
         self.compile_structure = compile_structure
         self.checkpoint_diffusion_conditioning = checkpoint_diffusion_conditioning
 
+    def _set_num_workers_zero(self) -> None:
+        """Set DataLoader num_workers to 0 to prevent fork-after-device-init crashes.
+
+        Different DataModule implementations store num_workers in different places:
+        - Some have it directly as self.data.num_workers
+        - FromGeneratedDataModule stores it in self.data.cfg.num_workers
+        """
+        if hasattr(self.data, "cfg") and hasattr(self.data.cfg, "num_workers"):
+            self.data.cfg.num_workers = 0
+            if hasattr(self.data.cfg, "pin_memory"):
+                self.data.cfg.pin_memory = False
+        if hasattr(self.data, "num_workers"):
+            self.data.num_workers = 0
+
     def run(self, config: OmegaConf = None, run_prediction=True) -> None:  # noqa: ARG002
         # Silence warnings and pytorch lightning tips
         quiet_startup()
@@ -124,7 +138,7 @@ class Predict(Task):
             elif isinstance(devices, (list, listconfig.ListConfig)):
                 devices = [devices[0]]
             self.trainer["devices"] = devices
-            self.data.num_workers = 0
+            self._set_num_workers_zero()
 
         # slurm
         if self.slurm:
@@ -176,8 +190,10 @@ class Predict(Task):
             if precision in ("16-mixed", "bf16-mixed"):
                 precision_plugin = HPUMixedPrecision(precision=precision)
             strategy = SingleHPUStrategy(precision_plugin=precision_plugin)
+            # SingleHPUStrategy only supports a single device
+            self.trainer["devices"] = 1
             # Fork after HPU init causes TCMalloc abort; single-threaded DataLoader required
-            self.data.num_workers = 0
+            self._set_num_workers_zero()
         else:
             # Set up trainer
             strategy = "auto"
