@@ -176,6 +176,8 @@ class Predict(Task):
             if precision in ("16-mixed", "bf16-mixed"):
                 precision_plugin = HPUMixedPrecision(precision=precision)
             strategy = SingleHPUStrategy(precision_plugin=precision_plugin)
+            # Fork after HPU init causes TCMalloc abort; single-threaded DataLoader required
+            self.data.num_workers = 0
         else:
             # Set up trainer
             strategy = "auto"
