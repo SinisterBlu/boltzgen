@@ -316,14 +316,18 @@ class InverseFoldingEncoder(nn.Module):
         dst_valid_mask = torch.gather(valid_mask, 1, dst_idx).flatten()
         edge_valid_mask = src_valid_mask & dst_valid_mask
 
-        src_idx = torch.gather(token_index, 1, src_idx).flatten()[edge_valid_mask]
-        dst_idx = torch.gather(token_index, 1, dst_idx).flatten()[edge_valid_mask]
+        # Boolean indexing (tensor[bool_mask]) is unsupported on HPU — use
+        # masked_select which is equivalent for 1-D tensors and works on all backends.
+        src_idx = torch.masked_select(
+            torch.gather(token_index, 1, src_idx).flatten(), edge_valid_mask
+        )
+        dst_idx = torch.masked_select(
+            torch.gather(token_index, 1, dst_idx).flatten(), edge_valid_mask
+        )
         edge_idx = torch.stack([src_idx, dst_idx], dim=0)
 
-        token_bonds, type_bonds = (
-            token_bonds[edge_valid_mask],
-            type_bonds[edge_valid_mask],
-        )
+        token_bonds = torch.masked_select(token_bonds, edge_valid_mask)
+        type_bonds = torch.masked_select(type_bonds, edge_valid_mask)
         type_bonds = one_hot(type_bonds, num_classes=len(const.bond_types) + 1)
         bond = torch.cat([token_bonds[..., None], type_bonds], dim=-1)
 
