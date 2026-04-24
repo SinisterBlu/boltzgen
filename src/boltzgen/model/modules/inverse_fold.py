@@ -12,6 +12,33 @@ from boltzgen.model.modules.scatter_utils import scatter_sum, scatter_softmax
 import torch.nn.functional as F
 
 
+def _hpu_select(tensor: Tensor, mask: Tensor) -> Tensor:
+    """Boolean-mask selection with CPU fallback for HPU compatibility.
+
+    HPU graph compiler rejects ops with dynamically-shaped outputs such as
+    boolean indexing (tensor[bool_mask]) and torch.masked_select.  Moving
+    the select to CPU then back is safe for inference and avoids graph
+    compilation failures.
+    """
+    if tensor.device.type == "hpu":
+        return tensor.cpu()[mask.cpu()].to(tensor.device)
+    return tensor[mask]
+
+
+def _hpu_assign(dst: Tensor, mask: Tensor, src: Tensor) -> None:
+    """Boolean-mask scatter-assignment with CPU fallback for HPU compatibility.
+
+    Replaces ``dst[bool_mask] = src`` which is unsupported by the HPU graph
+    compiler.  The mutation is performed on CPU and the result is copied back.
+    """
+    if dst.device.type == "hpu":
+        dst_cpu = dst.cpu()
+        dst_cpu[mask.cpu()] = src.cpu()
+        dst.data = dst_cpu.to(dst.device)
+    else:
+        dst[mask] = src
+
+
 class GaussianSmearing(torch.nn.Module):
     # used to embed the edge distances
     def __init__(self, start=0.0, stop=5.0, num_gaussians=50):
@@ -316,18 +343,16 @@ class InverseFoldingEncoder(nn.Module):
         dst_valid_mask = torch.gather(valid_mask, 1, dst_idx).flatten()
         edge_valid_mask = src_valid_mask & dst_valid_mask
 
-        # Boolean indexing (tensor[bool_mask]) is unsupported on HPU — use
-        # masked_select which is equivalent for 1-D tensors and works on all backends.
-        src_idx = torch.masked_select(
-            torch.gather(token_index, 1, src_idx).flatten(), edge_valid_mask
-        )
-        dst_idx = torch.masked_select(
-            torch.gather(token_index, 1, dst_idx).flatten(), edge_valid_mask
-        )
+        # Boolean indexing / masked_select produce dynamically-shaped output
+        # which the HPU graph compiler cannot handle — delegate to CPU.
+        src_tok = _hpu_select(torch.gather(token_index, 1, src_idx).flatten(), edge_valid_mask)
+        dst_tok = _hpu_select(torch.gather(token_index, 1, dst_idx).flatten(), edge_valid_mask)
+        src_idx = src_tok
+        dst_idx = dst_tok
         edge_idx = torch.stack([src_idx, dst_idx], dim=0)
 
-        token_bonds = torch.masked_select(token_bonds, edge_valid_mask)
-        type_bonds = torch.masked_select(type_bonds, edge_valid_mask)
+        token_bonds = _hpu_select(token_bonds, edge_valid_mask)
+        type_bonds = _hpu_select(type_bonds, edge_valid_mask)
         type_bonds = one_hot(type_bonds, num_classes=len(const.bond_types) + 1)
         bond = torch.cat([token_bonds[..., None], type_bonds], dim=-1)
 
@@ -348,7 +373,7 @@ class InverseFoldingEncoder(nn.Module):
             token_to_bb4_atoms.float().view(B, N * 4, -1), r.view(B, -1, 3)
         )
         r_repr = r_repr.reshape(B, N, 4, 3)
-        r_repr = r_repr[valid_mask]
+        r_repr = _hpu_select(r_repr, valid_mask)
 
         dist = torch.norm(
             r_repr[src_idx, None] - r_repr[dst_idx, :, None], dim=-1
@@ -362,10 +387,10 @@ class InverseFoldingEncoder(nn.Module):
     ) -> Tensor:
         src_idx, dst_idx = edge_idx[0], edge_idx[1]
 
-        feature_asym_id = feats["feature_asym_id"][valid_mask]
+        feature_asym_id = _hpu_select(feats["feature_asym_id"], valid_mask)
         b_same_chain = feature_asym_id[src_idx] == feature_asym_id[dst_idx]
 
-        feature_residue_index = feats["feature_residue_index"][valid_mask]
+        feature_residue_index = _hpu_select(feats["feature_residue_index"], valid_mask)
         b_same_residue = (
             feature_residue_index[src_idx] == feature_residue_index[dst_idx]
         )
@@ -391,11 +416,11 @@ class InverseFoldingEncoder(nn.Module):
             dim=-1,
         )
 
-        b_standard = feats["is_standard"].bool()[valid_mask][..., None]
-        mol_type = feats["mol_type"][valid_mask]
+        b_standard = _hpu_select(feats["is_standard"].bool(), valid_mask)[..., None]
+        mol_type = _hpu_select(feats["mol_type"], valid_mask)
         mol_type_one_hot = F.one_hot(mol_type, num_classes=len(const.chain_type_ids))
         nonpolymer_mask = mol_type == const.chain_type_ids["NONPOLYMER"]
-        modified = feats["modified"].unsqueeze(-1)[valid_mask]
+        modified = _hpu_select(feats["modified"].unsqueeze(-1), valid_mask)
 
         atom_feats = torch.cat(
             [
@@ -416,8 +441,8 @@ class InverseFoldingEncoder(nn.Module):
             atom_padding_sum_to_token = torch.bmm(
                 atom_to_token.transpose(1, 2), 1 - atom_mask.unsqueeze(-1)
             )
-            assert atom_padding_sum_to_token[valid_mask].sum() == 0
-        a = a[valid_mask]
+            assert _hpu_select(atom_padding_sum_to_token, valid_mask).sum() == 0
+        a = _hpu_select(a, valid_mask)
 
         node_attr = torch.cat(
             [
@@ -436,7 +461,7 @@ class InverseFoldingEncoder(nn.Module):
         geo_feat = self.extract_geo_feat(feats, edge_idx, valid_mask)
         node_attr, edge_attr = self.extract_attr_feat(feats, edge_idx, valid_mask)
         if self.enable_input_embedder:
-            node_attr = feats["s_inputs"][valid_mask]
+            node_attr = _hpu_select(feats["s_inputs"], valid_mask)
 
         N = valid_mask.sum()
         s = self.linear_token_to_node(node_attr)
@@ -518,7 +543,7 @@ class InverseFoldingDecoder(nn.Module):
             rand = torch.rand(valid_mask.sum(), device=valid_mask.device)
             res_type_edge_visibility = rand[src_idx] < rand[dst_idx]
             res_type_clone = feats["res_type_clone"].bool()
-            res_type_clone = res_type_clone[valid_mask][src_idx]
+            res_type_clone = _hpu_select(res_type_clone, valid_mask)[src_idx]
             res_type_clone = res_type_clone * res_type_edge_visibility[:, None]
             res_type_clone = res_type_clone.to(z)
         res_rep = self.seq_to_s(res_type_clone)
@@ -530,7 +555,7 @@ class InverseFoldingDecoder(nn.Module):
 
         B, N = valid_mask.shape
         logist_dense = torch.zeros(B, N, self.num_res_type, device=logits.device)
-        logist_dense[valid_mask] = logits
+        _hpu_assign(logist_dense, valid_mask, logits)
 
         out_dict = {
             "logits": logist_dense,
@@ -545,9 +570,9 @@ class InverseFoldingDecoder(nn.Module):
         num_nodes = s.shape[0]
 
         if "inverse_fold_design_mask" in feats:
-            design_mask = feats["inverse_fold_design_mask"].bool()[valid_mask]
+            design_mask = _hpu_select(feats["inverse_fold_design_mask"].bool(), valid_mask)
         else:
-            design_mask = feats["design_mask"].bool()[valid_mask]
+            design_mask = _hpu_select(feats["design_mask"].bool(), valid_mask)
         num_not_design = (~design_mask).sum().item()
         num_design = design_mask.sum().item()
         assert num_design == num_nodes - num_not_design, (
@@ -618,17 +643,17 @@ class InverseFoldingDecoder(nn.Module):
 
         n_tokens = valid_mask.shape[1]
         res_type = torch.zeros(1, n_tokens, self.num_res_type, device=s.device)
-        res_type[valid_mask] = decoded_seq
+        _hpu_assign(res_type, valid_mask, decoded_seq)
         unk_ids = torch.full(
             [(~valid_mask).sum().item()], const.tokens.index("UNK"), device=s.device
         )
         unk_value = F.one_hot(unk_ids, num_classes=const.num_tokens)
-        res_type[~valid_mask] = unk_value.float()
+        _hpu_assign(res_type, ~valid_mask, unk_value.float())
         feats["res_type"] = res_type.long()
 
         logist_dense = torch.zeros(1, n_tokens, self.num_res_type, device=logits.device)
-        logist_dense[valid_mask] = logits
-        logist_dense[~valid_mask] = feats["res_type_clone"][~valid_mask].float()
+        _hpu_assign(logist_dense, valid_mask, logits)
+        _hpu_assign(logist_dense, ~valid_mask, _hpu_select(feats["res_type_clone"], ~valid_mask).float())
 
         out_dict = {
             "logits": logist_dense,
