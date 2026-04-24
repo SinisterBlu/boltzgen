@@ -917,8 +917,13 @@ class BinderDesignPipeline:
             )
 
         # Handle use_kernels argument
-        # Kernels are CUDA-specific (cuequivariance), disable on XPU/other devices
-        if torch.cuda.is_available():
+        # Kernels are CUDA-specific (cuequivariance), disable on HPU/XPU/other devices.
+        # Check HPU first: PT_HPU_GPU_MIGRATION=1 causes torch.cuda.is_available() to
+        # return True on HPU, but cuEquivariance CUDA kernels do NOT run on Gaudi.
+        if hasattr(torch, "hpu") and torch.hpu.is_available():
+            use_kernels = False
+            print(f"Using kernels: {use_kernels} [HPU device, CUDA kernels disabled]")
+        elif torch.cuda.is_available():
             device_capability = torch.cuda.get_device_capability()
             use_kernels = None
             if args.use_kernels == "auto":
