@@ -950,27 +950,27 @@ class BinderDesignPipeline:
             protocol_config, args.config, step_names
         )
 
-        # Detect available devices (CUDA, XPU, or HPU)
+        # Detect available devices (HPU checked first — GPU migration makes cuda.is_available() True on HPU)
         if args.devices is not None:
             devices = args.devices
+        elif hasattr(torch, "hpu") and torch.hpu.is_available():
+            devices = torch.hpu.device_count()
         elif torch.cuda.is_available():
             devices = torch.cuda.device_count()
         elif hasattr(torch, "xpu") and torch.xpu.is_available():
             devices = torch.xpu.device_count()
-        elif hasattr(torch, "hpu") and torch.hpu.is_available():
-            devices = torch.hpu.device_count()
         else:
             devices = 1  # CPU fallback
         print(f"Using {devices} devices")
 
-        # Determine accelerator
+        # Determine accelerator (HPU checked first — GPU migration makes cuda.is_available() True on HPU)
         if args.accelerator == "auto":
-            if torch.cuda.is_available():
+            if hasattr(torch, "hpu") and torch.hpu.is_available():
+                accelerator = "hpu"
+            elif torch.cuda.is_available():
                 accelerator = "gpu"
             elif hasattr(torch, "xpu") and torch.xpu.is_available():
                 accelerator = "xpu"
-            elif hasattr(torch, "hpu") and torch.hpu.is_available():
-                accelerator = "hpu"
             else:
                 accelerator = "cpu"
         else:
