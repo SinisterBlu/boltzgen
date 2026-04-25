@@ -212,6 +212,10 @@ def to_mmcif(
             gemmi_struct.connections.append(con)
 
     gemmi_struct.add_model(model)
+    # Set a minimal space group so gemmi writes 'P 1' instead of an empty
+    # string for _symmetry.space_group_name_H-M.  An empty string is valid
+    # mmCIF but rejected by Mol* with "Invalid data cell" at parseTrajectory.
+    gemmi_struct.spacegroup_hm = "P 1"
     doc = gemmi_struct.make_mmcif_document()
     block = doc.sole_block()
 
