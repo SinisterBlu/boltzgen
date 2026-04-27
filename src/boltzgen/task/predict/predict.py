@@ -23,7 +23,7 @@ from boltzgen.task.predict.writer import (
 )
 from boltzgen.task.task import Task
 from boltzgen.utils.pipeline_progress_bar import PipelineProgressBar
-from boltzgen.utils.hpu import HPUMixedPrecision, SingleHPUStrategy
+from boltzgen.utils.hpu import HPUDDPStrategy, HPUMixedPrecision, SingleHPUStrategy
 from boltzgen.utils.xpu import SingleXPUStrategy, XPUMixedPrecision
 
 
@@ -189,9 +189,31 @@ class Predict(Task):
             precision_plugin = None
             if precision in ("16-mixed", "bf16-mixed"):
                 precision_plugin = HPUMixedPrecision(precision=precision)
-            strategy = SingleHPUStrategy(precision_plugin=precision_plugin)
-            # SingleHPUStrategy only supports a single device
-            self.trainer["devices"] = 1
+
+            # Multi-card: use HPUDDPStrategy (HCCL backend); single card: SingleHPUStrategy
+            num_devices = devices if isinstance(devices, int) else len(devices)
+            # Allow BOLTZGEN_HPU_DEVICES env var to override the config value
+            env_devices = os.environ.get("BOLTZGEN_HPU_DEVICES")
+            if env_devices is not None:
+                num_devices = int(env_devices)
+                self.trainer["devices"] = num_devices
+
+            if num_devices > 1:
+                # Cap at available HPU count to avoid silent misconfiguration
+                available = torch.hpu.device_count()
+                if num_devices > available:
+                    num_devices = available
+                    self.trainer["devices"] = num_devices
+                    print(f"BOLTZGEN_HPU_DEVICES capped to {available} (available HPUs).")
+                # Fewer designs than devices → reduce devices
+                if num_devices > len(self.data.predict_set):
+                    num_devices = max(1, len(self.data.predict_set))
+                    self.trainer["devices"] = num_devices
+                    print(f"Fewer designs than HPUs. Setting devices to {num_devices}.")
+                strategy = HPUDDPStrategy(precision_plugin=precision_plugin)
+            else:
+                strategy = SingleHPUStrategy(precision_plugin=precision_plugin)
+                self.trainer["devices"] = 1
             # Fork after HPU init causes TCMalloc abort; single-threaded DataLoader required
             self._set_num_workers_zero()
         else:
