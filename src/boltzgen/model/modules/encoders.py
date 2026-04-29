@@ -732,11 +732,15 @@ class AtomAttentionDecoder(Module):
             idx = idx.repeat_interleave(multiplicity, 0)
             src = q * mask[:, :, None]
             idx_expanded = idx.unsqueeze(-1).expand(-1, -1, q.size(-1))
+            # HPU lazy mode: scatter_add_ (in-place) on a freshly-created zero
+            # tensor generates a SliceInsert op whose starts param is unresolved
+            # at graph compile time, causing: SliceInsert starts param >= dimension.
+            # Non-in-place scatter_add() avoids this by not mutating an unresolved
+            # tensor. Semantics are identical; CPU/GPU behaviour is unchanged.
             s_feat = torch.zeros(
                 (q.shape[0], feats["res_type"].shape[1], q.shape[-1]),
                 device=idx_expanded.device,
-            )
-            s_feat.scatter_add_(dim=1, index=idx_expanded, src=src)
+            ).scatter_add(1, idx_expanded, src)
 
         if self.predict_res_type and s_feat is not None:
             res_type = self.res_type_predictor(s_feat)
