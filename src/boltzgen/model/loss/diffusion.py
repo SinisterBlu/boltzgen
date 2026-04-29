@@ -64,7 +64,8 @@ def weighted_rigid_align(
     true_coords_centered = true_coords - true_centroid
     pred_coords_centered = pred_coords - pred_centroid
 
-    if torch.any(mask.sum(dim=-1) < (dim + 1)):
+    # HPU lazy mode: avoid bool(tensor) as Python if condition — forces graph flush
+    if torch.any(mask.sum(dim=-1) < (dim + 1)).cpu().item():
         print(
             "Warning: The size of one of the point clouds is <= dim+1. "
              "`WeightedRigidAlign` cannot return a unique rotation."
@@ -85,7 +86,8 @@ def weighted_rigid_align(
     V = V.mH
 
     # Catch ambiguous rotation by checking the magnitude of singular values
-    if (S.abs() <= 1e-15).any() and not (num_points < (dim + 1)):
+    # HPU lazy mode: avoid bool(tensor) — move check to CPU side using .item()
+    if (S.abs() <= 1e-15).any().cpu().item() and not (num_points < (dim + 1)):
         print(
             "Warning: Excessively low rank of "
              "cross-correlation between aligned point clouds. "
@@ -96,10 +98,13 @@ def weighted_rigid_align(
     rot_matrix = torch.einsum("b i j, b k j -> b i k", U, V).to(dtype=torch.float32)
 
     # Ensure proper rotation matrix with determinant 1
-    F = torch.eye(dim, dtype=cov_matrix_32.dtype, device=cov_matrix.device)[
-        None
-    ].repeat(batch_size, 1, 1)
-    F[:, -1, -1] = torch.det(rot_matrix)
+    # HPU lazy mode fix: avoid negative-index SliceInsert (F[:, -1, -1] = ...)
+    # which generates an unresolvable starts param in the HPU graph compiler.
+    # Build F as a diagonal matrix: identity for first dim-1 entries, det on last.
+    det_vals = torch.det(rot_matrix)  # (batch,)
+    ones = torch.ones(batch_size, dim - 1, dtype=cov_matrix_32.dtype, device=cov_matrix.device)
+    diag_vals = torch.cat([ones, det_vals.unsqueeze(-1)], dim=-1)  # (batch, dim)
+    F = torch.diag_embed(diag_vals)  # (batch, dim, dim)
     rot_matrix = einsum(U, F, V, "b i j, b j k, b l k -> b i l")
     rot_matrix = rot_matrix.to(dtype=original_dtype)
 
@@ -108,7 +113,7 @@ def weighted_rigid_align(
         einsum(true_coords_centered, rot_matrix, "b n i, b j i -> b n j")
         + pred_centroid
     )
-    aligned_coords.detach_()
+    aligned_coords = aligned_coords.detach()
 
     return aligned_coords
 
