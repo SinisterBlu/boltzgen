@@ -73,9 +73,9 @@ def one_hot_bool(tensor, num_classes=-1):
     output_shape = list(tensor.shape) + [num_classes]
     result = torch.zeros(output_shape, dtype=torch.bool, device=tensor.device)
 
-    # Use scatter_ for efficient assignment
-    # scatter_(dim, index, src) - dim is the last dimension
-    result.scatter_(-1, tensor.unsqueeze(-1), True)
+    # HPU lazy mode: scatter_ (in-place) on a freshly-created tensor generates
+    # a SliceInsert op with unresolved starts. Use non-in-place scatter().
+    result = result.scatter(-1, tensor.unsqueeze(-1), True)
 
     return result
 

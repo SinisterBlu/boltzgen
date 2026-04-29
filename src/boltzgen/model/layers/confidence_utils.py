@@ -306,7 +306,9 @@ def compute_ptms(logits, x_preds, feats, multiplicity):
         atom_interact_mask = torch.zeros_like(atom_chain_design_mask)
         atom_interact_mask[atom_chain_design_mask] = (dists.min(0)[0] < 8).unsqueeze(0)
         index = torch.argmax(feats["atom_to_token"].int(), dim=-1)
-        interact_mask.scatter_(dim=1, index=index, src=atom_interact_mask)
+        # HPU lazy mode: scatter_ in-place on a pre-existing tensor generates
+        # SliceInsert. Use non-in-place scatter() with reassignment instead.
+        interact_mask = interact_mask.scatter(dim=1, index=index, src=atom_interact_mask)
 
     # Compute interface interaction pTM values: iipTM
     # Any ptm of the design that is interacting with the target to anything in the target

@@ -40,8 +40,10 @@ def scatter_sum(
         expanded_index = expanded_index.unsqueeze(-1)
     expanded_index = expanded_index.expand_as(src)
     
-    # Use scatter_add_ for summation
-    out.scatter_add_(dim, expanded_index, src)
+    # HPU lazy mode: scatter_add_ (in-place) on a freshly-created tensor
+    # generates a SliceInsert op with unresolved starts at graph compile time.
+    # Use non-in-place scatter_add() by reassigning — semantics are identical.
+    out = out.scatter_add(dim, expanded_index, src)
     
     return out
 
@@ -127,12 +129,9 @@ def scatter_max(
         expanded_index = expanded_index.unsqueeze(-1)
     expanded_index = expanded_index.expand_as(src)
     
-    # Use scatter_reduce for max operation (PyTorch >= 1.12)
-    if hasattr(out, 'scatter_reduce_'):
-        out.scatter_reduce_(dim, expanded_index, src, reduce='amax', include_self=False)
-    else:
-        # Fallback for older PyTorch versions
-        out.scatter_(dim, expanded_index, src, reduce='max')
+    # HPU lazy mode: scatter_reduce_ and scatter_ (in-place) on freshly-created
+    # tensors generate SliceInsert ops. Use non-in-place scatter_reduce() instead.
+    out = out.scatter_reduce(dim, expanded_index, src, reduce='amax', include_self=False)
     
     # Replace -inf with 0 for indices that were never written to
     out = torch.where(torch.isinf(out), torch.zeros_like(out), out)
