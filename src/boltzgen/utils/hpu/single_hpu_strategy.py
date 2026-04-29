@@ -159,22 +159,31 @@ class SingleHPUStrategy(SingleDeviceStrategy):
         return result
 
     def validation_step(self, *args: Any, **kwargs: Any) -> STEP_OUTPUT:
-        """Flush lazy graph after validation step."""
+        """Run validation step then flush lazy graph."""
         import habana_frameworks.torch.core as htcore
+        result = super().validation_step(*args, **kwargs)
         htcore.mark_step()
-        return super().validation_step(*args, **kwargs)
+        return result
 
     def test_step(self, *args: Any, **kwargs: Any) -> STEP_OUTPUT:
-        """Flush lazy graph after test step."""
+        """Run test step then flush lazy graph."""
         import habana_frameworks.torch.core as htcore
+        result = super().test_step(*args, **kwargs)
         htcore.mark_step()
-        return super().test_step(*args, **kwargs)
+        return result
 
     def predict_step(self, *args: Any, **kwargs: Any) -> Any:
-        """Flush lazy graph after predict step (inference path)."""
+        """Run predict step then flush lazy graph once per batch.
+
+        Calling mark_step() AFTER super() ensures the full forward-pass graph
+        is accumulated before it is dispatched to the HPU.  Calling it before
+        (as was done previously) caused every step to flush an incomplete graph,
+        triggering a fresh compilation for each dynamic shape encountered.
+        """
         import habana_frameworks.torch.core as htcore
+        result = super().predict_step(*args, **kwargs)
         htcore.mark_step()
-        return super().predict_step(*args, **kwargs)
+        return result
 
 
 StrategyRegistry.register(
