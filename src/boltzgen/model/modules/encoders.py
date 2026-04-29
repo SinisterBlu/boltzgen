@@ -67,7 +67,10 @@ class RelativePositionEncoder(Module):
         )
 
         _cyclic = feats["cyclic"]
-        if _cyclic.numel() > 0 and bool(torch.any(_cyclic > 0)):
+        # HPU lazy mode: avoid executing torch.any() on-device (triggers SliceInsert
+        # graph error). Move to CPU for the scalar boolean check only — the tensor
+        # itself stays on HPU for the downstream where() operations.
+        if _cyclic.numel() > 0 and bool(_cyclic.cpu().any()):
             period = torch.where(
                 feats["cyclic"] > 0,
                 feats["cyclic"],
