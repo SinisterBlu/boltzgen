@@ -66,7 +66,8 @@ class RelativePositionEncoder(Module):
             - feats["feature_residue_index"][:, None, :]
         )
 
-        if torch.any(feats["cyclic"] > 0):
+        _cyclic = feats["cyclic"]
+        if _cyclic.numel() > 0 and bool(torch.any(_cyclic > 0)):
             period = torch.where(
                 feats["cyclic"] > 0,
                 feats["cyclic"],
