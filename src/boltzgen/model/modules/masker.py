@@ -156,19 +156,30 @@ class BoltzMasker(Module):
             mask_val = torch.ones_like(clone["msa"]) * const.token_ids["UNK"]
             new["msa"] = torch.where(token_mask[:, None, :], mask_val, clone["msa"])
 
+            # HPU lazy mode fix: [:, 1:] slice assignment generates SliceInsert
+            # with start=1. When MSA has only 1 row, start(1) >= dimension(1)
+            # → "SliceInsert starts param >= dimension" error. Guard with CPU check.
             mask_val = torch.ones_like(clone["msa"]) * const.token_ids["-"]
-            new["msa"][:, 1:] = torch.where(
-                clone["target_msa_mask"][:, None, :].bool(),
-                mask_val[:, 1:],
-                new["msa"][:, 1:],
-            )
+            if new["msa"].shape[1] > 1:
+                new["msa"] = torch.cat([
+                    new["msa"][:, :1],
+                    torch.where(
+                        clone["target_msa_mask"][:, None, :].bool(),
+                        mask_val[:, 1:],
+                        new["msa"][:, 1:],
+                    ),
+                ], dim=1)
 
-            mask_val = torch.zeros_like(clone["msa_mask"][:, 1:])
-            new["msa_mask"][:, 1:] = torch.where(
-                clone["target_msa_mask"][:, None, :].bool(),
-                mask_val,
-                clone["msa_mask"][:, 1:],
-            )
+            if new["msa_mask"].shape[1] > 1:
+                msa_mask_rest = torch.where(
+                    clone["target_msa_mask"][:, None, :].bool(),
+                    torch.zeros_like(clone["msa_mask"][:, 1:]),
+                    clone["msa_mask"][:, 1:],
+                )
+                new["msa_mask"] = torch.cat([
+                    new["msa_mask"][:, :1],
+                    msa_mask_rest,
+                ], dim=1)
 
             mask_val = torch.zeros_like(clone["msa_paired"])
             new["msa_paired"] = torch.where(
