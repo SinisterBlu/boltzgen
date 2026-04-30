@@ -26,7 +26,7 @@ HPU Graphs (opt-in via BOLTZGEN_HPU_GRAPHS=1):
 
 import os
 import warnings
-from typing import Any, Callable, Dict, Union
+from typing import Any, Callable, Dict, Optional, Union
 
 import pytorch_lightning as pl
 import torch
@@ -290,13 +290,18 @@ class SingleHPUStrategy(SingleDeviceStrategy):
         htcore.mark_step()
         return result
 
-    def transfer_batch_to_device(
+    def batch_to_device(
         self,
-        batch: Dict,
-        device: torch.device,
-        dataloader_idx: int,
-    ) -> Dict:
+        batch: Any,
+        device: Optional[torch.device] = None,
+        dataloader_idx: int = 0,
+    ) -> Any:
         """Move batch to HPU then snap tensor shapes to static buckets.
+
+        Lightning 2.x calls ``strategy.batch_to_device()`` (not the 1.x
+        ``transfer_batch_to_device``).  The super() call handles the normal
+        device transfer (moves tensors to HPU via the LightningModule hooks),
+        then we apply static bucketing on the already-moved HPU tensors.
 
         Static-shape bucketing eliminates per-design HPU graph recompilation:
         instead of one compiled recipe per unique (n_tokens, n_atoms) pair,
@@ -308,7 +313,7 @@ class SingleHPUStrategy(SingleDeviceStrategy):
         is active).  Bucket sizes: ``BOLTZGEN_HPU_TOKEN_BUCKETS`` and
         ``BOLTZGEN_HPU_ATOM_BUCKETS`` env vars (comma-separated ints).
         """
-        batch = super().transfer_batch_to_device(batch, device, dataloader_idx)
+        batch = super().batch_to_device(batch, device, dataloader_idx)
 
         use_static = os.environ.get("BOLTZGEN_HPU_STATIC_SHAPES", "1") == "1"
         if use_static:
