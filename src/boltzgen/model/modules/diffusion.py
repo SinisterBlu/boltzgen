@@ -389,6 +389,10 @@ class AtomDiffusion(Module):
 
         if isinstance(sigma, float):
             sigma = torch.full((batch,), sigma, device=device)
+        elif isinstance(sigma, torch.Tensor) and sigma.dim() == 0:
+            # 0-dim tensor (scalar) from diffusion loop kept on device to avoid
+            # per-step lazy graph recompilation — expand to match batch dim.
+            sigma = sigma.expand(batch)
 
         padded_sigma = rearrange(sigma, "b -> b 1 1")
 
@@ -570,7 +574,10 @@ class AtomDiffusion(Module):
             use_tqdm=inference_logging,
             desc="Denoising steps.",
         ):
-            sigma_tm, sigma_t, gamma = sigma_tm.item(), sigma_t.item(), gamma.item()
+            # HPU lazy mode: keeping sigma_tm/sigma_t/gamma as 0-dim tensors (no .item())
+            # prevents baking different Python float constants into the lazy graph each
+            # step, which would force 200 recompilations per design.  Tensor arithmetic
+            # produces data-dependent nodes whose graph topology is identical every step.
             # sigma_tm is sigma_t-1 and sigma_t is sigma_t
             t_hat = sigma_tm * (1 + gamma)
             noise_var = noise_scale**2 * (t_hat**2 - sigma_tm**2)
@@ -585,7 +592,8 @@ class AtomDiffusion(Module):
                     torch.einsum("bmd,bds->bms", atom_coords, random_R) + random_tr
                 )
 
-            eps = noise_scale * sqrt(noise_var) * torch.randn(shape, device=self.device)
+            # torch.sqrt avoids math.sqrt's implicit .item() sync on 0-dim tensors
+            eps = noise_scale * torch.sqrt(noise_var.clamp(min=0)) * torch.randn(shape, device=self.device)
             atom_coords_noisy = atom_coords + eps
 
             with torch.no_grad():

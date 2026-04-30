@@ -25,6 +25,7 @@ HPU Graphs (opt-in via BOLTZGEN_HPU_GRAPHS=1):
 """
 
 import os
+import warnings
 from typing import Any, Callable, Dict, Union
 
 import pytorch_lightning as pl
@@ -81,7 +82,74 @@ class SingleHPUStrategy(SingleDeviceStrategy):
         """Move model to HPU then optionally wrap with HPU graph capture."""
         self.model_to_device()
         super().setup(trainer)
+        self._maybe_patch_fusedsdpa()
         self._maybe_wrap_hpu_graphs()
+
+    def _maybe_patch_fusedsdpa(self) -> None:
+        """Replace F.scaled_dot_product_attention with Habana FusedSDPA.
+
+        gpu_migration does NOT automatically redirect SDPA → FusedSDPA, so
+        every attention call falls back to the CPU reference implementation
+        (aten::_scaled_dot_product_attention_math).  FusedSDPA is Gaudi's
+        Flash-Attention equivalent: fully fused kernel, lower memory, same
+        BF16/FP32 interface.
+
+        The patch is applied globally to torch.nn.functional but only routes
+        HPU tensors to FusedSDPA; CPU/CUDA tensors continue to use the
+        original implementation unchanged.
+
+        Controlled by BOLTZGEN_HPU_FUSEDSDPA (default: 1 = enabled).
+        """
+        if os.environ.get("BOLTZGEN_HPU_FUSEDSDPA", "1") != "1":
+            return
+        try:
+            from habana_frameworks.torch.hpex.kernels import FusedSDPA
+            import torch.nn.functional as F
+
+            _orig_sdpa = F.scaled_dot_product_attention
+
+            def _hpu_sdpa(
+                query,
+                key,
+                value,
+                attn_mask=None,
+                dropout_p: float = 0.0,
+                is_causal: bool = False,
+                scale=None,
+                **kwargs,
+            ):
+                if query.device.type == "hpu":
+                    return FusedSDPA.apply(
+                        query, key, value, attn_mask, dropout_p, is_causal, scale
+                    )
+                return _orig_sdpa(
+                    query,
+                    key,
+                    value,
+                    attn_mask=attn_mask,
+                    dropout_p=dropout_p,
+                    is_causal=is_causal,
+                    scale=scale,
+                    **kwargs,
+                )
+
+            F.scaled_dot_product_attention = _hpu_sdpa
+            print(
+                "[SingleHPUStrategy] Patched F.scaled_dot_product_attention → FusedSDPA",
+                flush=True,
+            )
+        except ImportError:
+            warnings.warn(
+                "FusedSDPA not available (habana_frameworks not found). "
+                "Attention will use CPU math fallback.",
+                stacklevel=2,
+            )
+        except Exception as exc:  # noqa: BLE001
+            warnings.warn(
+                f"FusedSDPA patch failed: {exc}. "
+                "Attention will use CPU math fallback.",
+                stacklevel=2,
+            )
 
     def _maybe_wrap_hpu_graphs(self) -> None:
         """Wrap model forward with HPU graph capture/replay if enabled.
@@ -172,6 +240,9 @@ class SingleHPUStrategy(SingleDeviceStrategy):
         htcore.mark_step()
         return result
 
+    # Class-level counter so the profiler fires only on the first N steps.
+    _profile_steps_done: int = 0
+
     def predict_step(self, *args: Any, **kwargs: Any) -> Any:
         """Run predict step then flush lazy graph once per batch.
 
@@ -179,8 +250,42 @@ class SingleHPUStrategy(SingleDeviceStrategy):
         is accumulated before it is dispatched to the HPU.  Calling it before
         (as was done previously) caused every step to flush an incomplete graph,
         triggering a fresh compilation for each dynamic shape encountered.
+
+        Optional profiling: set ``BOLTZGEN_PROFILE_STEPS=N`` (env var) to wrap
+        the first N predict_steps with ``torch.profiler``.  Outputs:
+          • /app/benchmarks/profiles/design_trace_<N>.json  (Chrome/Perfetto)
+          • printed per-op CPU-time table (top 40 ops)
+        Open the JSON at https://ui.perfetto.dev for a flame graph.
         """
         import habana_frameworks.torch.core as htcore
+
+        profile_n = int(os.environ.get("BOLTZGEN_PROFILE_STEPS", "0"))
+        if profile_n > 0 and SingleHPUStrategy._profile_steps_done < profile_n:
+            SingleHPUStrategy._profile_steps_done += 1
+            step_idx = SingleHPUStrategy._profile_steps_done
+            trace_path = f"/app/benchmarks/profiles/design_trace_{step_idx}.json"
+            os.makedirs("/app/benchmarks/profiles", exist_ok=True)
+            print(f"[PROFILER] Capturing predict_step {step_idx} → {trace_path}", flush=True)
+
+            prof = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU],
+                record_shapes=True,
+                with_stack=True,
+                profile_memory=True,
+            )
+            with prof:
+                result = super().predict_step(*args, **kwargs)
+            htcore.mark_step()
+
+            prof.export_chrome_trace(trace_path)
+            table = prof.key_averages(group_by_stack_n=5).table(
+                sort_by="cpu_time_total", row_limit=40
+            )
+            print(f"\n[PROFILER] Top ops by CPU time (step {step_idx}):\n{table}", flush=True)
+            print(f"[PROFILER] Chrome trace → {trace_path}", flush=True)
+            print(f"[PROFILER] Open at https://ui.perfetto.dev", flush=True)
+            return result
+
         result = super().predict_step(*args, **kwargs)
         htcore.mark_step()
         return result
