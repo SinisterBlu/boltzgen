@@ -312,7 +312,15 @@ class SingleHPUStrategy(SingleDeviceStrategy):
 
         use_static = os.environ.get("BOLTZGEN_HPU_STATIC_SHAPES", "1") == "1"
         if use_static:
-            from boltzgen.utils.hpu.static_shapes import pad_batch_to_buckets
+            from boltzgen.utils.hpu.static_shapes import pad_batch_to_buckets, get_token_buckets, get_atom_buckets
+            # Print bucket config once on first call
+            if not getattr(self, "_buckets_logged", False):
+                self._buckets_logged = True
+                print(
+                    f"[STATIC_SHAPES] token_buckets={get_token_buckets()} "
+                    f"atom_buckets={get_atom_buckets()}",
+                    flush=True,
+                )
             batch = pad_batch_to_buckets(batch)
 
         return batch

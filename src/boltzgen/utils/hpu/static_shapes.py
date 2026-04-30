@@ -27,12 +27,27 @@ The bucketing is applied automatically by SingleHPUStrategy when
 Bucket sizes can be overridden:
   BOLTZGEN_HPU_TOKEN_BUCKETS=64,128,256,384,512,1024
   BOLTZGEN_HPU_ATOM_BUCKETS=896,1792,3584,7168,14336
+
+Shape Logging
+-------------
+Set ``BOLTZGEN_SHAPE_LOG=1`` (default: 1) to emit a [SHAPE_LOG] line to
+stdout and append a JSON record to ``/tmp/hpu_shape_log.jsonl`` on every
+batch.  Each line reports raw dims, assigned buckets, padding overhead,
+and whether this bucket combination is a first-time compile trigger.
+This lets you identify which designs land in different buckets and tune
+the bucket lists to minimise recompilations.
+
+Grep the benchmark log:
+  grep SHAPE_LOG /tmp/bench_lazy_*.log
+  grep COMPILE_TRIGGER /tmp/bench_lazy_*.log
 """
 
 from __future__ import annotations
 
+import json
 import os
-from typing import Dict, List, Optional
+import time
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 from torch import Tensor
@@ -70,6 +85,76 @@ def snap_to_bucket(size: int, buckets: List[int]) -> int:
         if size <= b:
             return b
     return max(buckets)
+
+
+# ---------------------------------------------------------------------------
+# Shape logger
+# ---------------------------------------------------------------------------
+
+# Module-level state — persists for the lifetime of the process.
+_seen_buckets: Set[Tuple[int, int]] = set()   # (token_bucket, atom_bucket) pairs compiled so far
+_call_count: int = 0                           # total transfer_batch_to_device calls
+_shape_log_path: str = "/tmp/hpu_shape_log.jsonl"
+_t0: float = time.monotonic()                  # process start time for relative timestamps
+
+
+def _log_shape(
+    n_tokens: int,
+    token_bucket: int,
+    n_atoms: int,
+    atom_bucket: int,
+) -> None:
+    """Log raw dims, assigned buckets, and compile-trigger status.
+
+    Output goes to stdout (grep-friendly) AND to /tmp/hpu_shape_log.jsonl
+    for post-run analysis.
+
+    Tokens/atoms overhead = how many padding elements were added (wasted
+    compute).  First time a (token_bucket, atom_bucket) pair is seen it
+    marks a COMPILE_TRIGGER — expect a long pause after this batch.
+    """
+    global _call_count
+    _call_count += 1
+
+    bucket_key = (token_bucket, atom_bucket)
+    is_new = bucket_key not in _seen_buckets
+    if is_new:
+        _seen_buckets.add(bucket_key)
+
+    tok_pad = token_bucket - n_tokens
+    atom_pad = atom_bucket - n_atoms
+    tok_pct = 100 * tok_pad / token_bucket if token_bucket else 0
+    atom_pct = 100 * atom_pad / atom_bucket if atom_bucket else 0
+    tag = "COMPILE_TRIGGER" if is_new else "BUCKET_HIT"
+    elapsed = time.monotonic() - _t0
+
+    # Stdout line — survives tqdm CR-overwrite via \n
+    print(
+        f"[SHAPE_LOG] call={_call_count:04d} t={elapsed:8.1f}s "
+        f"tokens={n_tokens}->{token_bucket}(+{tok_pad},{tok_pct:.0f}%) "
+        f"atoms={n_atoms}->{atom_bucket}(+{atom_pad},{atom_pct:.0f}%) "
+        f"seen={len(_seen_buckets)} {tag}",
+        flush=True,
+    )
+
+    # JSONL file — append one record per call
+    try:
+        record = {
+            "call": _call_count,
+            "elapsed_s": round(elapsed, 2),
+            "n_tokens": n_tokens,
+            "token_bucket": token_bucket,
+            "token_pad": tok_pad,
+            "n_atoms": n_atoms,
+            "atom_bucket": atom_bucket,
+            "atom_pad": atom_pad,
+            "is_compile_trigger": is_new,
+            "n_unique_buckets": len(_seen_buckets),
+        }
+        with open(_shape_log_path, "a") as fh:
+            fh.write(json.dumps(record) + "\n")
+    except OSError:
+        pass  # don't crash inference if log file is unwriteable
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +267,9 @@ def pad_batch_to_buckets(
     if token_bucket == n_tokens and atom_bucket == n_atoms:
         # Already bucket-aligned — nothing to do
         return batch
+
+    if os.environ.get("BOLTZGEN_SHAPE_LOG", "1") == "1":
+        _log_shape(n_tokens, token_bucket, n_atoms, atom_bucket)
 
     padded: Dict = {}
     for key, value in batch.items():
