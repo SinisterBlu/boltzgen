@@ -57,8 +57,20 @@ from torch import Tensor
 # Bucket configuration
 # ---------------------------------------------------------------------------
 
-DEFAULT_TOKEN_BUCKETS: List[int] = [64, 128, 192, 256, 320, 384, 512, 768, 1024]
-DEFAULT_ATOM_BUCKETS: List[int] = [896, 1792, 2688, 3584, 5376, 7168, 10752, 14336]
+# Tuned buckets derived from shape_run_v2 shape logger data (binder_length=50, 1UBQ target).
+#
+# Observed raw shapes per pipeline step:
+#   design:          tokens=126, atoms=1312  (was wasting 27% in 1792 bucket)
+#   inverse_folding: tokens=126, atoms=832   (was wasting  7% in 896  bucket — acceptable)
+#   design_folding:  tokens=50,  atoms=416   (was wasting 54% in 896  bucket)
+#
+# Changes vs original defaults:
+#   TOKEN: added 160  → covers binder_length=70 (146 tokens, 9% waste vs 24% in 192)
+#   ATOM:  added 448  → covers design_folding   (416 atoms,  7% waste vs 54% in 896)
+#   ATOM:  added 640  → covers design_folding for binder_length=70 (~560 atoms)
+#   ATOM:  added 1344 → covers design step      (1312 atoms, 2% waste vs 27% in 1792)
+DEFAULT_TOKEN_BUCKETS: List[int] = [64, 128, 160, 192, 256, 320, 384, 512, 768, 1024]
+DEFAULT_ATOM_BUCKETS: List[int] = [448, 640, 896, 1344, 1792, 2688, 3584, 5376, 7168, 10752, 14336]
 
 
 def _parse_bucket_env(env_var: str, defaults: List[int]) -> List[int]:
