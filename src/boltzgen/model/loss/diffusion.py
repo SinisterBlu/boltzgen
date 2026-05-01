@@ -164,13 +164,21 @@ def weighted_rigid_align(
     original_dtype = cov_matrix.dtype
     cov_matrix_32 = cov_matrix.to(dtype=torch.float32)
 
-    # HPU does not support torch.linalg.svd or torch.det natively — both fall back
-    # to CPU causing 8000+ HPU→CPU→HPU round trips per run (4000 SVD + 4000 det).
-    # Replace with HPU-native implementations:
-    #   SVD: one-sided Jacobi iterations on the 3×3 covariance matrix
-    #   det: closed-form 3×3 determinant using element-wise ops only
+    # HPU does not natively support torch.linalg.svd or torch.det — both
+    # fall back to CPU automatically but with per-call detection overhead.
+    # For the tiny 3×3 covariance matrix, the optimal strategy is to
+    # explicitly transfer to CPU (36 bytes), use optimised LAPACK there,
+    # and transfer the result back.  This eliminates:
+    #   • the per-call fallback-detection overhead (~50ms × 400 calls/run)
+    #   • the Jacobi iterative approach (HPU dispatch overhead per tiny op)
+    # The large-dimension work (einsum over n_atoms) still runs on HPU.
     if cov_matrix_32.device.type == "hpu":
-        U, S, V = _svd3x3_jacobi(cov_matrix_32)
+        cov_cpu = cov_matrix_32.detach().cpu()
+        U_cpu, S_cpu, Vh_cpu = torch.linalg.svd(cov_cpu)
+        V_cpu = Vh_cpu.mH
+        U = U_cpu.to(cov_matrix_32.device)
+        S = S_cpu.to(cov_matrix_32.device)
+        V = V_cpu.to(cov_matrix_32.device)
     else:
         U, S, V = torch.linalg.svd(
             cov_matrix_32,

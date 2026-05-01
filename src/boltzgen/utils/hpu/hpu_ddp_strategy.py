@@ -15,7 +15,8 @@ Usage in predict.py:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import os
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 from lightning_habana import HPUParallelStrategy as _HPUParallelStrategy
@@ -33,6 +34,10 @@ class HPUDDPStrategy(_HPUParallelStrategy):
 
     Wraps lightning_habana.HPUParallelStrategy with the same guard/interface
     as SingleHPUStrategy so predict.py can switch between them transparently.
+
+    Static shape bucketing is applied in batch_to_device, identical to
+    SingleHPUStrategy, so multi-card runs benefit from the same recipe-cache
+    optimisation as single-card runs.
     """
 
     strategy_name = "hpu_ddp"
@@ -52,3 +57,36 @@ class HPUDDPStrategy(_HPUParallelStrategy):
             process_group_backend="hccl",
             **kwargs,
         )
+
+    def batch_to_device(
+        self,
+        batch: Any,
+        device: Optional[torch.device] = None,
+        dataloader_idx: int = 0,
+    ) -> Any:
+        """Move batch to HPU then snap tensor shapes to static buckets.
+
+        Mirrors the identical override in SingleHPUStrategy so that multi-card
+        DDP runs get the same static-shape bucketing benefit as single-card runs.
+        Each DDP rank pads its own shard of the batch independently before
+        forwarding — this is correct because all ranks always receive shards of
+        the same bucket size (DataLoader already distributed uniformly).
+        """
+        batch = super().batch_to_device(batch, device, dataloader_idx)
+
+        use_static = os.environ.get("BOLTZGEN_HPU_STATIC_SHAPES", "1") == "1"
+        if use_static:
+            from boltzgen.utils.hpu.static_shapes import get_atom_buckets, get_token_buckets, pad_batch_to_buckets
+
+            if not getattr(self, "_buckets_logged", False):
+                self._buckets_logged = True
+                # Only log on rank 0 to avoid 8× duplicate lines
+                if self.global_rank == 0:
+                    print(
+                        f"[STATIC_SHAPES] token_buckets={get_token_buckets()} "
+                        f"atom_buckets={get_atom_buckets()} (DDP rank 0)",
+                        flush=True,
+                    )
+            batch = pad_batch_to_buckets(batch)
+
+        return batch
