@@ -47,7 +47,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 from torch import Tensor
@@ -226,6 +226,31 @@ def _pad_tensor(
     return torch.nn.functional.pad(t, pad_spec, mode="constant", value=0)
 
 
+def _numpy_to_tensor_recursive(obj: Any) -> Any:
+    """Recursively convert numpy arrays to torch tensors.
+
+    ``wrap_in_hpu_graph`` hashes every value in the model's input via
+    ``input_hash``, which handles ``torch.Tensor``, ``dict``, ``list``,
+    and ``tuple`` but raises ``TypeError: unhashable type: 'numpy.ndarray'``
+    on any numpy array it encounters.  BoltzGen batches mix tensors with
+    auxiliary numpy arrays (e.g. residue-type arrays, structure metadata),
+    so we must convert them before the graph wrapper sees the batch.
+
+    Only ``numpy.ndarray`` objects are converted; all other types (str, int,
+    Python objects) are returned unchanged.
+    """
+    import numpy as np  # local import — numpy is always present in this env
+
+    if isinstance(obj, np.ndarray):
+        return torch.from_numpy(obj)
+    if isinstance(obj, dict):
+        return {k: _numpy_to_tensor_recursive(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        converted = [_numpy_to_tensor_recursive(v) for v in obj]
+        return type(obj)(converted)
+    return obj
+
+
 def pad_batch_to_buckets(
     batch: Dict,
     token_buckets: Optional[List[int]] = None,
@@ -255,6 +280,10 @@ def pad_batch_to_buckets(
         token_buckets = get_token_buckets()
     if atom_buckets is None:
         atom_buckets = get_atom_buckets()
+
+    # Convert any numpy arrays to torch tensors so that wrap_in_hpu_graph's
+    # input_hash can hash the full batch without raising TypeError.
+    batch = _numpy_to_tensor_recursive(batch)
 
     # Determine n_tokens and n_atoms from mask tensors.
     # token_pad_mask shape: [batch, n_tokens] — 1 for real tokens, 0 for pad
