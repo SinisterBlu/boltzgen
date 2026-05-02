@@ -41,49 +41,47 @@ from torch.nn import Module
 from torch.optim.optimizer import Optimizer
 
 
-def _numpy_to_tensor_recursive(obj):
-    """Recursively convert numeric numpy arrays to torch tensors.
+def _patch_input_hash_for_numpy() -> None:
+    """Patch habana_frameworks input_hash to handle numpy.ndarray.
 
-    wrap_in_hpu_graph's input_hash recurses through all model inputs and
-    raises TypeError on numpy.ndarray.  This converts numeric arrays to
-    tensors so input_hash can hash them.  Structured/void/object arrays
-    (dtype.kind in 'VO') are left as-is — they are Python-hashable.
+    wrap_in_hpu_graph hashes every model input to determine cache hits.
+    Its ``input_hash`` function recurses into dicts/lists/tuples but raises
+    ``TypeError: unhashable type: 'numpy.ndarray'`` on any numpy array.
+
+    Because ``input_hash`` is a module-level function that calls itself by
+    name, replacing it in the module's globals causes ALL recursive calls to
+    use the patched version — this is safe and complete.
+
+    Strategy: numeric arrays → hash the equivalent torch.Tensor;
+              structured/void/object arrays → hash by identity (id).
     """
-    import numpy as np
-    if isinstance(obj, np.ndarray):
-        if obj.dtype.kind in ("V", "O"):
-            return obj  # structured/object — hashable as-is
-        try:
-            return torch.from_numpy(obj)
-        except TypeError:
-            return obj
-    if isinstance(obj, dict):
-        return {k: _numpy_to_tensor_recursive(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        converted = [_numpy_to_tensor_recursive(v) for v in obj]
-        return type(obj)(converted)
-    return obj
+    try:
+        import numpy as np
+        import habana_frameworks.torch.hpu.graphs as _hg
 
+        if getattr(_hg, "_input_hash_numpy_patched", False):
+            return  # already patched — idempotent
 
-class _NumpySafeWrapper(torch.nn.Module):
-    """Thin shim placed OUTSIDE wrap_in_hpu_graph.
+        _orig = _hg.input_hash
 
-    wrap_in_hpu_graph's input_hash cannot handle numpy.ndarray arguments —
-    it raises ``TypeError: unhashable type``.  This wrapper converts any
-    numpy arrays in args/kwargs to torch tensors before the graph wrapper
-    sees them, so input_hash only encounters hashable types.
+        def _safe_input_hash(obj):
+            if isinstance(obj, np.ndarray):
+                if obj.dtype.kind in ("V", "O"):
+                    # Structured/object arrays: not convertible, use identity
+                    return hash(id(obj))
+                try:
+                    t = torch.from_numpy(np.ascontiguousarray(obj))
+                    return _orig(t)
+                except Exception:
+                    return hash(id(obj))
+            return _orig(obj)
 
-    Stack: Lightning → _NumpySafeWrapper → HPU-graph-wrapped model → forward
-    """
-
-    def __init__(self, inner: torch.nn.Module) -> None:
-        super().__init__()
-        self._inner = inner
-
-    def forward(self, *args, **kwargs):
-        args = tuple(_numpy_to_tensor_recursive(a) for a in args)
-        kwargs = {k: _numpy_to_tensor_recursive(v) for k, v in kwargs.items()}
-        return self._inner(*args, **kwargs)
+        _hg.input_hash = _safe_input_hash
+        _hg._input_hash_numpy_patched = True
+        print("[SingleHPUStrategy] Patched habana input_hash for numpy.ndarray support", flush=True)
+    except Exception as exc:
+        import warnings
+        warnings.warn(f"Could not patch input_hash for numpy: {exc}", stacklevel=2)
 
 
 class SingleHPUStrategy(SingleDeviceStrategy):
@@ -230,15 +228,10 @@ class SingleHPUStrategy(SingleDeviceStrategy):
 
         try:
             from habana_frameworks.torch.hpu.graphs import wrap_in_hpu_graph
+            # Patch input_hash BEFORE wrapping so the graph wrapper never
+            # encounters unhashable numpy arrays in any model input.
+            _patch_input_hash_for_numpy()
             wrapped = wrap_in_hpu_graph(model, max_graphs=max_graphs)
-
-            # BoltzGen passes numpy arrays (structured/void dtypes, metadata arrays)
-            # as part of model inputs.  wrap_in_hpu_graph's input_hash recurses into
-            # all args and raises TypeError on numpy.ndarray.  Fix: place a thin shim
-            # module OUTSIDE the graph wrapper that converts numpy→tensor before
-            # input_hash ever sees the inputs.
-            wrapped = _NumpySafeWrapper(wrapped)
-
             # Replace the model on the strategy and on the trainer
             self.model = wrapped
             if hasattr(self, "_lightning_module"):
