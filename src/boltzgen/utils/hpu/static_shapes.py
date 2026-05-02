@@ -236,13 +236,22 @@ def _numpy_to_tensor_recursive(obj: Any) -> Any:
     auxiliary numpy arrays (e.g. residue-type arrays, structure metadata),
     so we must convert them before the graph wrapper sees the batch.
 
-    Only ``numpy.ndarray`` objects are converted; all other types (str, int,
-    Python objects) are returned unchanged.
+    Only numeric numpy arrays are converted; structured/void arrays (dtype
+    kind == 'V') and object arrays are left as-is — they are hashable Python
+    objects and ``input_hash`` can handle them via ``hash(obj)``.
     """
     import numpy as np  # local import — numpy is always present in this env
 
     if isinstance(obj, np.ndarray):
-        return torch.from_numpy(obj)
+        # Structured dtypes (numpy.void, record arrays) cannot be converted to
+        # tensors with torch.from_numpy.  They are hashable as Python objects,
+        # so leave them for input_hash to handle directly.
+        if obj.dtype.kind == "V" or obj.dtype.kind == "O":
+            return obj
+        try:
+            return torch.from_numpy(obj)
+        except TypeError:
+            return obj  # fallback: leave unconvertible arrays unchanged
     if isinstance(obj, dict):
         return {k: _numpy_to_tensor_recursive(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
